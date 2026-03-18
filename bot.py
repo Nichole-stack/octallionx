@@ -502,7 +502,7 @@ def main():
     app.job_queue.run_daily(job_daily_summary, time=dtime(hour=DAILY_HOUR, minute=0))
 
     log.info("OCTALLION online")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
 if __name__ == "__main__":
     main()
