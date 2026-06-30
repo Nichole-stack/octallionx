@@ -2,10 +2,12 @@
 OCTALLION — Polymarket Trading Bot for Telegram
 """
 
+import asyncio
 import os
 import json
 import logging
 import httpx
+import xml.etree.ElementTree as ET
 from datetime import datetime, time as dtime
 from typing import Optional
 from dotenv import load_dotenv
@@ -25,6 +27,15 @@ ALERT_THRESHOLD  = float(os.getenv("ALERT_THRESHOLD", "5"))
 DAILY_HOUR       = int(os.getenv("DAILY_HOUR", "8"))
 POLYMARKET_GAMMA = "https://gamma-api.polymarket.com"
 ANTHROPIC_URL    = "https://api.anthropic.com/v1/messages"
+AGENT_INTERVAL   = int(os.getenv("AGENT_INTERVAL", "3600"))
+WALLET           = "0x1bd1418b12073cad0eef94c1cc3dbc1f29adb948"
+
+NEWS_FEEDS = [
+    ("BBC World",     "https://feeds.bbci.co.uk/news/world/rss.xml"),
+    ("Reuters",       "https://feeds.reuters.com/reuters/topNews"),
+    ("CoinTelegraph", "https://cointelegraph.com/rss"),
+    ("Decrypt",       "https://decrypt.co/feed"),
+]
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("octallion")
@@ -225,6 +236,7 @@ async def cmd_start(update, ctx):
         "`/nba` — NBA markets\n"
         "`/soccer` — soccer markets\n"
         "`/analyze <keyword>` — AI analysis\n"
+        "`/news` — agent scan: news → market signals\n"
         "`/add <market> <YES/NO> <entry> <amount>` — track position\n"
         "`/positions` — your positions + P&L\n"
         "`/update <#> <new price>` — update position\n"
@@ -435,6 +447,101 @@ async def cmd_summary(update, ctx):
         text += "🔥 *TOP VOLUME*\n" + "".join(f"• {m['title'][:45]}\n  `YES {m['yes']}c` | `${fmt_vol(m['volume'])}`\n" for m in top)
     await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
 
+async def fetch_headlines(limit=15):
+    headlines = []
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for source, url in NEWS_FEEDS:
+            try:
+                r = await client.get(url)
+                r.raise_for_status()
+                root = ET.fromstring(r.text)
+                for item in root.findall(".//item"):
+                    title = (item.findtext("title") or "").strip()
+                    if title:
+                        headlines.append({"source": source, "title": title})
+                    if len(headlines) >= limit:
+                        break
+            except Exception as e:
+                log.warning(f"news feed {source}: {e}")
+            if len(headlines) >= limit:
+                break
+    return headlines[:limit]
+
+
+async def ai_news_correlate(headlines, markets):
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == "YOUR_ANTHROPIC_KEY_HERE":
+        return "Set ANTHROPIC_API_KEY to enable AI correlation."
+    news_block = "\n".join(f"- [{h['source']}] {h['title']}" for h in headlines)
+    market_block = "\n".join(
+        f"- {m['title']} (YES {m['yes']}c | Vol ${fmt_vol(m['volume'])})"
+        for m in markets[:20]
+    )
+    prompt = (
+        "You are an autonomous prediction market intelligence agent.\n\n"
+        f"BREAKING NEWS:\n{news_block}\n\n"
+        f"ACTIVE PREDICTION MARKETS:\n{market_block}\n\n"
+        "1. Pick 3-5 news stories most likely to shift market prices today.\n"
+        "2. For each, name the relevant market and directional impact (YES↑/↓).\n"
+        "3. Flag any market that looks mispriced given today's news.\n"
+        "4. End with: TRADE SIGNAL: <one-line summary>\n\n"
+        "Be concise, specific, numerical. No disclaimers."
+    )
+    headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 900,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(ANTHROPIC_URL, json=body, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            return "".join(b.get("text", "") for b in data.get("content", []))
+    except Exception as e:
+        return f"AI unavailable: {e}"
+
+
+async def cmd_news(update, ctx):
+    msg = await update.message.reply_text("📰 Scanning news + markets...")
+    headlines, markets = await asyncio.gather(fetch_headlines(), fetch_markets(limit=30))
+    if not headlines:
+        await msg.edit_text("Could not fetch news feeds right now.")
+        return
+    analysis = await ai_news_correlate(headlines, markets)
+    now = datetime.utcnow().strftime("%b %d %H:%M UTC")
+    text = (
+        f"⬛ *AGENT REPORT* — _{now}_\n"
+        f"{'─' * 30}\n\n"
+        f"📰 *LATEST HEADLINES*\n"
+        + "".join(f"• [{h['source']}] {h['title'][:60]}\n" for h in headlines[:8])
+        + f"\n{'─' * 30}\n\n"
+        f"🤖 *AI SIGNAL*\n{analysis[:900]}"
+    )
+    await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def job_agent_cycle(context):
+    """Periodic autonomous news + market scan pushed to AGENT_CHAT_ID."""
+    agent_chat = os.getenv("AGENT_CHAT_ID", "")
+    if not agent_chat:
+        return
+    try:
+        headlines, markets = await asyncio.gather(fetch_headlines(), fetch_markets(limit=30))
+        analysis = await ai_news_correlate(headlines, markets)
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        text = (
+            f"⬛ *AGENT CYCLE* — _{now}_\n"
+            f"{'─' * 30}\n\n"
+            f"{analysis[:1000]}\n\n"
+            f"📊 `{len(markets)}` markets | `{len(headlines)}` headlines\n"
+            f"`{WALLET[:14]}…`"
+        )
+        await context.bot.send_message(chat_id=int(agent_chat), text=text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        log.error(f"agent cycle: {e}")
+
+
 async def handle_message(update, ctx):
     text = update.message.text.strip()
     if not text:
@@ -495,11 +602,13 @@ def main():
     app.add_handler(CommandHandler("watch",     cmd_watch))
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
     app.add_handler(CommandHandler("summary",   cmd_summary))
+    app.add_handler(CommandHandler("news",      cmd_news))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.job_queue.run_repeating(job_price_alerts, interval=900, first=60)
     app.job_queue.run_daily(job_daily_summary, time=dtime(hour=DAILY_HOUR, minute=0))
+    app.job_queue.run_repeating(job_agent_cycle, interval=AGENT_INTERVAL, first=120)
 
     log.info("OCTALLION online")
     app.run_polling(drop_pending_updates=True, close_loop=False)
